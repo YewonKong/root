@@ -1,0 +1,149 @@
+package batch;
+import java.sql.*;
+import java.util.*;
+
+public class ReportBatchJob {
+    private static final String DB_URL = "jdbc:oracle:thin:@localhost:1521:xe";
+    private static final String DB_USER = "user";
+    private static final String DB_PASSWORD = "1234";
+
+    /*
+     * 기준일자와 보고서ID를 입력받아 보고서 생성
+     * 기준일자: YYYYMMDD, 보고서ID: RPTXXXXXXXXXX
+     */
+    public static void main(String[] args) {
+        String BaseYMD = args.length > 0 ? args[0] : "20250330"; // 기준일자 입력
+        String ReportId = args.length > 1 ? args[1] : "RPT2025020701"; // 보고서 ID 입력
+        procPartition(BaseYMD); // 배치 재작업을 고려하여 일파티션 TRUNCATE 삭제 처리
+        generateReport(BaseYMD, ReportId); // 보고서 생성
+    }
+
+    /*
+     * 배치 재작업을 고려하여 일 파티션 데이터 TRUNCATE
+     * @param BaseYMD 기준일자(YYYYMMDD)
+     */
+    private static void procPartition(String BaseYMD) {
+        String truncateQuery = "ALTER TABLE report_data TRUNCATE PARTITION FOR (TO_DATE('" + BaseYMD + "', 'YYYYMMDD'))";
+        
+        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD);
+             Statement stmt = conn.createStatement()) {
+        	     stmt.executeUpdate(truncateQuery);
+                 System.out.println("기준일자 " + BaseYMD + " 일 파티션 TRUNCATE 완료");
+        } catch (SQLException e) {
+            System.err.println("[ERROR] 파티션 삭제 중 오류 발생: " + e.getMessage());
+        }
+    }
+
+    /*
+     * 보고서 데이터 생성
+     * 특정일자의 여신/수신 데이터 기반으로 상품별/잔존기간별 잔액, 금리 내역 출력
+     * 데이터 미존재 시 에러메시지 출력, 데이터 중복 오류 발생 시 예외 처리
+     * @param BaseYMD 기준일자(YYYYMMDD)
+     * @param ReportId 조회대상 보고서ID
+     */
+    private static void generateReport(String BaseYMD, String ReportId) {
+        String query = """
+            SELECT  A.REP_ID,
+                    A.REP_NM,
+                    A.REP_CODE,
+                    A.REMN_TERM,
+                    SUM(NVL(A.TOT_BAL,0))  TOT_BAL,
+                    ROUND(SUM(NVL(A.TOT_BAL,0) * A.INT_RATE) / SUM(NVL(A.TOT_BAL,0)), 2)  INT_RATE_AVG
+            FROM    (
+                     SELECT A.REP_ID,A.REP_NM,A.REP_CODE,
+                            CASE WHEN B.GDS_CODE = D.GDS_CODE
+                                      THEN (CASE WHEN D.END_YMD = ? THEN '당일'
+                                                 WHEN (D.END_YMD - TO_DATE(?, 'YYYYMMDD')) > 0    AND (D.END_YMD - TO_DATE(?, 'YYYYMMDD')) <= 180 THEN '6개월 이하'
+                                                 WHEN (D.END_YMD - TO_DATE(?, 'YYYYMMDD')) > 180 AND (D.END_YMD - TO_DATE(?, 'YYYYMMDD')) <= 365 THEN '6개월~1년 이하'
+                                                 WHEN (D.END_YMD - TO_DATE(?, 'YYYYMMDD')) > 365 THEN '1년 초과'
+                                                 ELSE 'X'
+                                         END)
+                                 WHEN B.GDS_CODE = E.GDS_CODE
+                                      THEN (CASE WHEN E.END_YMD = ? THEN '당일'
+                                                 WHEN (E.END_YMD - TO_DATE(?, 'YYYYMMDD')) > 0     AND (E.END_YMD - TO_DATE(?, 'YYYYMMDD')) <= 180 THEN '6개월 이하'
+                                                 WHEN (D.END_YMD - TO_DATE(?, 'YYYYMMDD')) > 180 AND (D.END_YMD - TO_DATE(?, 'YYYYMMDD')) <= 365 THEN '6개월~1년 이하'
+                                                 WHEN (E.END_YMD - TO_DATE(?, 'YYYYMMDD')) > 365 THEN '1년 초과'
+                                                 ELSE 'X'
+                                            END)
+                                 ELSE 'X'
+                            END  REMN_TERM,
+                            NVL(C.TOT_BAL,0)  TOT_BAL,
+                            NVL(C.INT_RATE,0)  INT_RATE
+                     FROM   REPORT_INFO A
+                          , REPORT_GDS_MAP B
+                          , ACCOUNT_LEDGER C  -- 계정원장
+                          , LOAN_LEDGER D     -- 여신원장
+                          , DEPOSIT_LEDGER E  -- 수신원장
+                     WHERE  A.REP_ID = ?
+                     AND    A.REP_CODE = B.REP_CODE
+                     AND    A.GDS_CODE = B.GDS_CODE
+                     AND    C.BASE_YMD = ?
+                     AND    B.GDS_CODE = C.GDS_CODE
+                     AND    D.BASE_YMD(+) = ?
+                     AND    C.GDS_CODE = D.GDS_CODE(+)
+                     AND    E.BASE_YMD(+) = ?
+                     AND    C.GDS_CODE = E.GDS_CODE(+)
+                     AND    (D.END_YMD >= TO_CHAR(SYSDATE,'YYYYMMDD') OR E.END_YMD >= TO_CHAR(SYSDATE,'YYYYMMDD'))  -- 당일 포함 잔존만기가 존재하는 상품내역에 한해 추출
+                    )
+            GROUP BY A.REP_ID,
+                     A.REP_NM,
+                     A.REP_CODE,
+                     A.REMN_TERM
+        """;
+
+        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD);
+             PreparedStatement pstmt = conn.prepareStatement(query)) {
+            
+            // SQL 입력 파라미터 바인딩
+            pstmt.setString(1, BaseYMD);
+            pstmt.setString(2, BaseYMD);
+            pstmt.setString(3, BaseYMD);
+            pstmt.setString(4, BaseYMD);
+            pstmt.setString(5, BaseYMD);
+            pstmt.setString(6, BaseYMD);
+            pstmt.setString(7, BaseYMD);
+            pstmt.setString(8, BaseYMD);
+            pstmt.setString(9, ReportId);
+            pstmt.setString(10, BaseYMD);
+            pstmt.setString(11, BaseYMD);
+            pstmt.setString(12, BaseYMD);
+            
+            ResultSet rs = pstmt.executeQuery();
+            
+            // 결과값 존재여부 확인
+            if (!rs.isBeforeFirst()) { 
+                System.err.println("[ERROR] 조회된 데이터가 없습니다 => 기준일자: " + BaseYMD + ", 보고서 ID: " + ReportId);
+                return;
+            }
+            
+            // 보고서 결과 출력
+            System.out.println("보고서ID | 보고서명 | 보고서코드 | 잔존기간 | 잔액 | 금리");
+            Set<String> uniqueCheck = new HashSet<>();
+            while (rs.next()) {
+            	String reportId = rs.getString("REP_ID");
+                String reportCode = rs.getString("REP_CODE");
+
+                // 보고서코드를 2자리씩 나누어 상품코드 중복여부 체크
+                for (int i = 0; i < reportCode.length() - 1; i += 2) {
+                    String gdsCode = reportCode.substring(i, Math.min(i + 2, reportCode.length()));
+
+                    // '보고서코드|상품코드' 형식으로 임시키 생성하여 중복 체크
+                    String key = reportId + "|" + gdsCode;
+                    if (!uniqueCheck.add(key)) {
+                        throw new SQLException("[ERROR] 데이터 중복 오류 발생 => 보고서ID: " + reportId + ", 중복된 상품코드: " + gdsCode);
+                    }
+                }
+                
+                System.out.printf("%d | %s | %s | %.2f | %.2f%% | %d days\n",
+                        rs.getInt("REP_ID"),
+                        rs.getString("REP_NM"),
+                        rs.getString("REP_CODE"),
+                        rs.getDouble("REMN_TERM"),
+                        rs.getDouble("TOT_BAL"),
+                        rs.getInt("INT_RATE_AVG"));
+            }
+        } catch (SQLException e) {
+            System.err.println("[ERROR] 데이터 처리 중 오류 발생: " + e.getMessage());
+        }
+    }
+}
